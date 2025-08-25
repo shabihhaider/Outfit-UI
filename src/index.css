@@ -1,0 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* optional: nicer default background */
+:root { color-scheme: light; }
+body { @apply bg-zinc-50 text-zinc-900; }
