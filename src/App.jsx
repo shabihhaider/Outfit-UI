@@ -15,7 +15,9 @@ import {
   Sparkles,
   Heart,
   Star,
-  Palette
+  Palette,
+  MapPin,
+  Navigation2
 } from "lucide-react";
 
 // Constants + Utils
@@ -317,6 +319,13 @@ export default function App() {
   const [colorMode, setColorMode] = useLocalStorage("colorMode", "auto");
   const [perBucket, setPerBucket] = useLocalStorage("perBucket", 5);
   const [topk, setTopk] = useLocalStorage("topk", 20);
+  const [weatherHint, setWeatherHint] = useLocalStorage("weatherHint", "mild");
+  const [autoWeather, setAutoWeather] = useLocalStorage("autoWeather", true);
+  const [coords, setCoords] = useLocalStorage("coords", null); // {lat, lon}
+  const [liveWeather, setLiveWeather] = useLocalStorage("liveWeather", null); // {temp_c, precip_mm, wind_kph, code, hint}
+  const [weatherAnalytics, setWeatherAnalytics] = useState(null);
+  const [weatherTrends, setWeatherTrends] = useState(null);
+  const [weatherError, setWeatherError] = useState("");
   const [colorWeight, setColorWeight] = useLocalStorage("colorWeight", 0.15);
   const [styleWeight, setStyleWeight] = useLocalStorage("styleWeight", 0.1);
   const [diversityWeight, setDiversityWeight] = useLocalStorage("diversityWeight", 0.05);
@@ -361,6 +370,85 @@ useEffect(() => {
   }, [setWardrobe]);
 
   // API calls
+
+  // ---- Live Weather (frontend) ----
+  const getBrowserLocation = useCallback(() => {
+    return new Promise((resolve, reject) => {
+      if (!("geolocation" in navigator)) return reject(new Error("Geolocation not available"));
+      const opts = { enableHighAccuracy: false, timeout: 8000, maximumAge: 600000 };
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve({ lat: Number(pos.coords.latitude.toFixed(4)), lon: Number(pos.coords.longitude.toFixed(4)) }),
+        (err) => reject(new Error(err?.message || "Location permission denied")),
+        opts
+      );
+    });
+  }, []);
+
+  const fetchLiveWeather = useCallback(async (loc, includeAnalytics = false) => {
+    const key = `wx:${loc.lat.toFixed(2)},${loc.lon.toFixed(2)}`;
+    try {
+      const cached = JSON.parse(sessionStorage.getItem(key) || "null");
+      if (cached && Date.now() - cached.ts < 10 * 60 * 1000 && !includeAnalytics) {
+        return { weather: cached.data, analytics: cached.analytics || null };
+      }
+
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 9000);
+      
+      // Fetch current weather
+      const r = await fetch(`${apiBase}/weather?lat=${loc.lat}&lon=${loc.lon}`, { signal: ctrl.signal });
+      clearTimeout(to);
+      if (!r.ok) {
+        const body = await r.text();
+        let msg = body;
+        try { msg = JSON.parse(body).detail || body; } catch {}
+        throw new Error(`Weather API: ${msg}`);
+      }
+      const weatherData = await r.json();
+      
+      // Fetch analytics if requested
+      let analytics = null;
+      if (includeAnalytics) {
+        try {
+          const analyticsResponse = await fetch(`${apiBase}/weather/analytics?lat=${loc.lat}&lon=${loc.lon}`, { signal: ctrl.signal });
+          if (analyticsResponse.ok) {
+            analytics = await analyticsResponse.json();
+          }
+        } catch (e) {
+          console.warn("Weather analytics fetch failed:", e);
+        }
+      }
+      
+      sessionStorage.setItem(key, JSON.stringify({ ts: Date.now(), data: weatherData, analytics }));
+      return { weather: weatherData, analytics };
+    } catch (e) {
+      throw new Error(e.message || "Weather fetch failed");
+    }
+  }, [apiBase]);
+
+  // Auto fetch on toggle / health change
+  useEffect(() => {
+    (async () => {
+      if (!autoWeather || !health.ok) return;
+      try {
+        const loc = coords || await getBrowserLocation();
+        if (!coords) setCoords(loc);
+        const result = await fetchLiveWeather(loc, true);
+        const wx = result.weather || result; // Handle both new and old response formats
+        setLiveWeather(wx);
+        if (result.analytics) {
+          setWeatherAnalytics(result.analytics);
+        }
+        setWeatherError("");
+        // Use enhanced hint if available
+        const hint = wx.hint || "mild";
+        if (!weatherHint || weatherHint === "mild") setWeatherHint(hint);
+      } catch (e) {
+        setWeatherError(String(e.message || e));
+      }
+    })();
+  }, [autoWeather, apiBase, health.ok]);
+
   const runCatalogRecommendation = useCallback(async () => {
     if (!anchorFile) return setError("Please upload an image first");
     if (allowTypesSet.size === 0) {
@@ -414,7 +502,28 @@ useEffect(() => {
     try {
       const formData = new FormData();
       BUCKETS.forEach((bucket) => (wardrobe[bucket] || []).forEach((f) => formData.append(bucket, f)));
-      formData.append("topk", String(Math.min(topk, 15)));
+      formData.append("topk", String(topk));
+      formData.append("weather_hint", weatherHint || "mild"); // "hot" | "cold" | "rain" | "mild"
+      formData.append("weather_hint", weatherHint || "mild");
+
+      if (autoWeather && coords) {
+        formData.append("lat", String(coords.lat));
+        formData.append("lon", String(coords.lon));
+      }
+
+      if (liveWeather) {
+        formData.append("weather_json", JSON.stringify({
+          temp_c: liveWeather.temp_c,
+          feels_like: liveWeather.feels_like || liveWeather.temp_c,
+          precip_mm: liveWeather.precip_mm,
+          wind_kph: liveWeather.wind_kph,
+          humidity: liveWeather.humidity,
+          code: liveWeather.code,
+          hint: liveWeather.hint,
+          temp_trend: liveWeather.temp_trend,
+          rain_likelihood: liveWeather.rain_likelihood
+        }));
+      }
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 90000);
@@ -533,8 +642,35 @@ useEffect(() => {
                 </div>
                 <div className="flex items-center gap-1 text-xs text-slate-500">
                   <Heart className="h-3 w-3 fill-rose-400 text-rose-400" />
-                  <span>{combo.score?.toFixed?.(3)}</span>
+                  <span>{Math.round((combo.score || 0) * 100)}%</span>
+                  {combo.explain?.wx_hint && (
+                    <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] text-emerald-700">
+                      Season-ready
+                    </span>
+                  )}
+                  {(combo.explain?.fashion_rules?.violations?.length || 0) > 0 && (
+                    <MapPin className="ml-1 h-3 w-3 text-red-500" title="Check rule notes" />
+                  )}
                 </div>
+                {combo.explain && (
+                  <div className="text-[11px] text-slate-500 space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span>Compatibility: {combo.explain.compat?.toFixed?.(2)}</span>
+                      <span>Weather: {combo.explain.weather?.toFixed?.(2)}</span>
+                    </div>
+                    {combo.explain.temp_c && (
+                      <div className="flex items-center gap-4">
+                        <span>Temp: {combo.explain.temp_c}°C</span>
+                        {combo.explain.rain_likelihood > 0 && (
+                          <span>Rain: {combo.explain.rain_likelihood}%</span>
+                        )}
+                        <span className="capitalize text-xs px-1.5 py-0.5 rounded bg-slate-100">
+                          {combo.explain.wx_hint || "mild"}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </Card>
           </motion.div>
@@ -722,7 +858,7 @@ useEffect(() => {
                         <label className="mb-1 block text-xs font-medium text-slate-600">Per Category</label>
                         <input 
                           type="number" 
-                          min={1} 
+                          min={0} 
                           max={10} 
                           value={perBucket} 
                           onChange={(e) => setPerBucket(Number(e.target.value) || 5)} 
@@ -734,7 +870,7 @@ useEffect(() => {
                         <label className="mb-1 block text-xs font-medium text-slate-600">Total Results</label>
                         <input 
                           type="number" 
-                          min={1} 
+                          min={0} 
                           max={50} 
                           value={topk} 
                           onChange={(e) => setTopk(Number(e.target.value) || 20)} 
@@ -915,8 +1051,8 @@ useEffect(() => {
                       <label className="mb-2 block text-sm font-medium text-slate-700">Max Outfits</label>
                       <input 
                         type="number" 
-                        min={1} 
-                        max={20} 
+                        min={0} 
+                        max={9999} 
                         value={topk} 
                         onChange={(e) => setTopk(Number(e.target.value) || 10)} 
                         className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-violet-300 focus:ring-2 focus:ring-violet-200 focus:outline-none" 
@@ -934,6 +1070,164 @@ useEffect(() => {
                         <option value="comfortable">Comfortable Grid</option>
                         <option value="compact">Compact View</option>
                       </select>
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <label className="mb-2 block text-sm font-medium text-slate-700 flex items-center gap-2">
+                          <Cloud className="h-4 w-4" /> Weather Context
+                        </label>
+                        <Tag color="violet">
+                          {weatherAnalytics?.temp_c?.toFixed?.(1) || "?"}°C
+                        </Tag>
+                      </div>
+                      <div className="space-y-3">
+                        <select
+                          value={weatherHint}
+                          onChange={(e) => setWeatherHint(e.target.value)}
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 focus:ring-2 focus:ring-violet-200 focus:outline-none"
+                          disabled={isLoading}
+                        >
+                          <option value="mild">Mild / Any Weather</option>
+                          <option value="hot">Hot Weather</option>
+                          <option value="cold">Cold Weather</option>
+                          <option value="rain">Rainy Weather</option>
+                        </select>
+
+                        <div className="flex items-center justify-between gap-3">
+                          <label className="inline-flex items-center gap-2 text-sm text-slate-700">
+                            <input
+                              type="checkbox"
+                              checked={autoWeather}
+                              onChange={(e) => setAutoWeather(e.target.checked)}
+                              className="h-4 w-4 rounded border-slate-300"
+                              disabled={isLoading}
+                            />
+                            Use live weather
+                          </label>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            icon={Navigation2}
+                            onClick={async () => {
+                              try {
+                                const loc = await getBrowserLocation();
+                                setCoords(loc);
+                                const result = await fetchLiveWeather(loc, true);
+                                const wx = result.weather || result;
+                                setLiveWeather(wx);
+                                if (result.analytics) {
+                                  setWeatherAnalytics(result.analytics);
+                                }
+                                setWeatherHint(wx.hint || "mild");
+                                setWeatherError("");
+                                push({ 
+                                  title: "Weather updated", 
+                                  message: `${wx.temp_c?.toFixed?.(1) || "?"}°C • Feels ${wx.feels_like?.toFixed?.(1) || "?"}°C • ${wx.hint}`, 
+                                  variant: "ok" 
+                                });
+                              } catch (e) {
+                                setWeatherError(String(e.message || e));
+                                push({ title: "Weather failed", message: String(e.message || e), variant: "error" });
+                              }
+                            }}
+                          >
+                            Update Location
+                          </Button>
+                        </div>
+
+                        {/* Enhanced Weather Display */}
+                        <div className="rounded-lg bg-slate-50 p-3 text-xs space-y-2">
+                          <div className="flex items-center gap-2 text-slate-600">
+                            <MapPin className="h-3.5 w-3.5" />
+                            {coords ? `${coords.lat.toFixed(2)}, ${coords.lon.toFixed(2)}` : "No location set"}
+                          </div>
+                          
+                          {liveWeather ? (
+                            <div className="space-y-1">
+                              <div className="flex items-center justify-between">
+                                <span className="text-slate-600">Current:</span>
+                                <span className="font-medium">
+                                  {liveWeather.temp_c?.toFixed?.(1) || "?"}°C 
+                                  {liveWeather.feels_like && liveWeather.feels_like !== liveWeather.temp_c && (
+                                    <span className="text-slate-500 ml-1">(feels {liveWeather.feels_like.toFixed(1)}°C)</span>
+                                  )}
+                                </span>
+                              </div>
+                              
+                              {liveWeather.humidity && (
+                                <div className="flex items-center justify-between">
+                                  <span className="text-slate-600">Humidity:</span>
+                                  <span>{liveWeather.humidity.toFixed(0)}%</span>
+                                </div>
+                              )}
+                              
+                              {liveWeather.wind_kph > 0 && (
+                                <div className="flex items-center justify-between">
+                                  <span className="text-slate-600">Wind:</span>
+                                  <span>{liveWeather.wind_kph.toFixed(1)} km/h</span>
+                                </div>
+                              )}
+                              
+                              {liveWeather.rain_likelihood > 0 && (
+                                <div className="flex items-center justify-between">
+                                  <span className="text-slate-600">Rain chance:</span>
+                                  <span className={cn(
+                                    liveWeather.rain_likelihood > 60 ? "text-blue-600" : 
+                                    liveWeather.rain_likelihood > 30 ? "text-yellow-600" : "text-green-600"
+                                  )}>
+                                    {liveWeather.rain_likelihood.toFixed(0)}%
+                                  </span>
+                                </div>
+                              )}
+                              
+                              <div className="flex items-center justify-between pt-1 border-t border-slate-200">
+                                <span className="text-slate-600">Condition:</span>
+                                <span className={cn(
+                                  "px-2 py-0.5 rounded-full text-[10px] font-medium",
+                                  liveWeather.hint === "hot" && "bg-orange-100 text-orange-700",
+                                  liveWeather.hint === "cold" && "bg-blue-100 text-blue-700",
+                                  liveWeather.hint === "rain" && "bg-slate-100 text-slate-700",
+                                  liveWeather.hint === "mild" && "bg-green-100 text-green-700"
+                                )}>
+                                  {liveWeather.hint || "mild"}
+                                </span>
+                              </div>
+                              
+                              {liveWeather.temp_trend && liveWeather.temp_trend !== "stable" && (
+                                <div className="flex items-center justify-between">
+                                  <span className="text-slate-600">Trend:</span>
+                                  <span className={cn(
+                                    liveWeather.temp_trend === "warming" ? "text-orange-600" : "text-blue-600"
+                                  )}>
+                                    {liveWeather.temp_trend}
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                          ) : weatherError ? (
+                            <span className="text-red-600">{weatherError}</span>
+                          ) : (
+                            <span className="text-slate-500">Live weather not loaded</span>
+                          )}
+                          
+                          {weatherAnalytics && (
+                            <div className="pt-2 border-t border-slate-200">
+                              <div className="text-[10px] font-medium text-slate-600 mb-1">Today's Context</div>
+                              <div className="flex items-center justify-between">
+                                <span className="text-slate-500">Season:</span>
+                                <span className="capitalize">{weatherAnalytics.seasonal_context}</span>
+                              </div>
+                              {weatherAnalytics.temperature && (
+                                <div className="flex items-center justify-between">
+                                  <span className="text-slate-500">Avg temp:</span>
+                                  <span>{weatherAnalytics.temperature.avg}°C</span>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
                     </div>
 
                     <Button 
